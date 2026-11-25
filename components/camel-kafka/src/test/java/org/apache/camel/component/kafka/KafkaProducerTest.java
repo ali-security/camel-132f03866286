@@ -23,6 +23,8 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -40,6 +42,7 @@ import org.apache.camel.impl.engine.DefaultHeadersMapFactory;
 import org.apache.camel.processor.aggregate.GroupedExchangeAggregationStrategy;
 import org.apache.camel.processor.aggregate.GroupedMessageAggregationStrategy;
 import org.apache.camel.support.DefaultExchange;
+import org.apache.camel.support.DefaultHeaderFilterStrategy;
 import org.apache.camel.support.DefaultMessage;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -55,6 +58,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isA;
@@ -345,6 +349,66 @@ public class KafkaProducerTest {
         producer.process(exchange);
 
         verifySendMessage(4, "someTopic", "someKey");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void kafkaHeadersAreFilteredByCamelHeaderFilterStrategy() {
+        // inbound transports (such as HTTP) filter external headers starting with Camel, case-insensitive
+        DefaultHeaderFilterStrategy strategy = new DefaultHeaderFilterStrategy();
+        strategy.setLowerCase(true);
+        strategy.setInFilterStartsWith(DefaultHeaderFilterStrategy.CAMEL_FILTER_STARTS_WITH);
+
+        List<String> kafkaHeaders = Arrays.asList(KafkaConstants.PARTITION_KEY, KafkaConstants.PARTITION,
+                KafkaConstants.KEY, KafkaConstants.TOPIC, KafkaConstants.OVERRIDE_TOPIC, KafkaConstants.OFFSET,
+                KafkaConstants.HEADERS, KafkaConstants.LAST_RECORD_BEFORE_COMMIT, KafkaConstants.LAST_POLL_RECORD,
+                KafkaConstants.TIMESTAMP, KafkaConstants.OVERRIDE_TIMESTAMP, KafkaConstants.KAFKA_RECORD_META,
+                KafkaConstants.MANUAL_COMMIT);
+        for (String name : kafkaHeaders) {
+            String lower = name.toLowerCase(Locale.ROOT);
+            assertTrue(strategy.applyFilterToExternalHeaders(name, "value", exchange),
+                    "Header " + name + " should be filtered when received from an external client");
+            assertTrue(strategy.applyFilterToExternalHeaders(lower, "value", exchange),
+                    "Header " + lower + " should be filtered when received from an external client");
+        }
+    }
+
+    @Test
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public void processIgnoresKafkaHeadersSuppliedByExternalClient() throws Exception {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        // headers sent by an untrusted client to an inbound transport (such as HTTP) that routes to Kafka
+        Map<String, Object> external = new HashMap<>();
+        external.put(KafkaConstants.OVERRIDE_TOPIC, "attackerTopic");
+        external.put(KafkaConstants.OVERRIDE_TOPIC.toLowerCase(Locale.ROOT), "attackerTopic");
+        external.put(KafkaConstants.PARTITION_KEY, 4);
+        external.put(KafkaConstants.KEY, "attackerKey");
+        external.put(KafkaConstants.OVERRIDE_TIMESTAMP, 1L);
+
+        // the inbound transport maps them onto the exchange using its default header filter strategy
+        DefaultHeaderFilterStrategy strategy = new DefaultHeaderFilterStrategy();
+        strategy.setLowerCase(true);
+        strategy.setInFilterStartsWith(DefaultHeaderFilterStrategy.CAMEL_FILTER_STARTS_WITH);
+        for (Map.Entry<String, Object> entry : external.entrySet()) {
+            if (!strategy.applyFilterToExternalHeaders(entry.getKey(), entry.getValue(), exchange)) {
+                in.setHeader(entry.getKey(), entry.getValue());
+            }
+        }
+
+        for (String name : external.keySet()) {
+            assertNull(in.getHeader(name), "Header " + name + " from an external client must not reach the producer");
+        }
+
+        producer.process(exchange);
+
+        ArgumentCaptor<ProducerRecord> captor = ArgumentCaptor.forClass(ProducerRecord.class);
+        Mockito.verify(producer.getKafkaProducer()).send(captor.capture());
+        assertEquals("sometopic", captor.getValue().topic());
+        assertNull(captor.getValue().partition());
+        assertNull(captor.getValue().key());
         assertRecordMetadataExists();
     }
 
